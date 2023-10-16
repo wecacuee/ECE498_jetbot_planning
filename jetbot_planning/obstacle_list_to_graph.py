@@ -62,7 +62,9 @@ class ObstacleListToGraph:
     def _discretize(self, s):
         # divide by the step size, then round to convert the number to the nearest integer
         # and then multiply by the step size again.
-        return np.round(s / self.map.state_discrete_step) * self.map.state_discrete_step
+        sd = np.round(s / self.map.state_discrete_step) * self.map.state_discrete_step
+        sd[2] = Angle.wrap(sd[2])
+        return sd
         
     def _get_bounds(self, current_state):
         vmin, vmax = self.robot.linvel_range

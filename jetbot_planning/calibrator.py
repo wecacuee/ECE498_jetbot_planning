@@ -1,3 +1,5 @@
+from enum import Enum
+
 import rclpy
 from rclpy.node import Node
 
@@ -39,11 +41,6 @@ def rotmat(theta):
     return np.array([[np.cos(theta), -np.sin(theta)],
                      [np.sin(theta), np.cos(theta)]])
 
-def shortest_path_astar(state, obstacles, goal):
-    # astar algorithm here
-    path = [(0.01, 0.01)]
-    return path
-
 def new_twist(linear_vel, ang_vel, scale_lin=-0.60, scale_ang=-0.70):
     twist = Twist()
     twist.linear.x = scale_lin * linear_vel
@@ -53,6 +50,10 @@ def new_twist(linear_vel, ang_vel, scale_lin=-0.60, scale_ang=-0.70):
     twist.angular.y = 0.
     twist.angular.z = scale_ang * ang_vel
     return twist
+
+class MoveStopCycle(Enum):
+    MOVE = 0
+    STOP = 1
 
 class Calibrator(Node):
     def __init__(self):
@@ -69,8 +70,25 @@ class Calibrator(Node):
         self.prev_robot_pose_wrt_goal = []
         self.rate = self.create_rate(int(1.0/DT))
 
+        self.timer = self.create_timer(DT, self.timer_callback)
+        self.next_vel_to_pub = (0., 0.)
+        self.robot_behaviour_state = {
+            # The robot is lost. Rotate in place until marker is found
+            'lost': False,
+            # How much have we rotated since we were last lost
+            'rotated_since_lost': 0,
+            'no_robot_pose_counter': 0,
+
+            # The robot published a move command or a stop command.
+            # We are going to cycle between the two for consistency
+            'move_stop_cycle': MoveStopCycle.STOP,
+
+            # Are we ready for next cmd
+            'ready_for_next_twist': False
+        }
+
     def on_aruco_detection(self, msg):
-        if self.ignore_aruco_detection:
+        if not self.robot_behaviour_state['ready_for_next_twist']:
             return
         for m in msg.markers:
             axis, angle = axangle_from_quat(np.array(
@@ -85,37 +103,62 @@ class Calibrator(Node):
         robot_pose_wrt_goal = np.hstack((
             - rotmat(-pose_goal[2]) @ pose_goal[:2],
             - pose_goal[2]))
-        self.get_logger().info('Pose: {}'.format(robot_pose_wrt_goal))
+        #self.get_logger().info('Pose: {}'.format(robot_pose_wrt_goal))
         if len(self.prev_robot_pose_wrt_goal):
-            self.get_logger().info('Lin vel: {}'.format(
-                np.linalg.norm(self.prev_robot_pose_wrt_goal[-1][:2] -
-                               robot_pose_wrt_goal[:2]) / DT
-            ))
-        else:
-            if len(self.prev_robot_pose_wrt_goal) > 5:
-                sellf.prev_robot_pose_wrt_goal.pop(0)
+            self.get_logger().info('Avg Lin vel: {}'.format(
+                sum([np.linalg.norm(prev[:2] - cur[:2]) / DT
+                     for prev, cur in zip(self.prev_robot_pose_wrt_goal, 
+                                          self.prev_robot_pose_wrt_goal[1:] +
+                                          [robot_pose_wrt_goal])]) /
+                len(self.prev_robot_pose_wrt_goal))
+            )
 
         self.prev_robot_pose_wrt_goal.append(robot_pose_wrt_goal)
-        if self.counter >= 0:
-            self.pub.publish(new_twist(VMIN, 0.))
-            self.counter -= 1
-            self.disable_subscription()
-            self.publish_zero_timer = self.create_timer(DT, self.publish_zero)
+        if len(self.prev_robot_pose_wrt_goal) <= 5:
+            self.next_vel_to_pub = (VMIN, 0.)
+            self.robot_behaviour_state['ready_for_next_twist'] = False
         else:
-            self.disable_subscription()
+            self.next_vel_to_pub = (0., 0.)
+            self.robot_behaviour_state['ready_for_next_twist'] = False
 
-    def publish_zero(self):
-        self.pub.publish(new_twist(0., 0.))
-        self.renable_subscriptions_timer = self.create_timer(
-            DT, self.renable_subscription)
-        self.destroy_timer(self.publish_zero_timer)
 
-    def disable_subscription(self):
-        self.ignore_aruco_detection = True
+    def _publish_move_stop(self, lin_ang_vel):
+        moved = False
+        # Alternate between move and stop cycles
+        if self.robot_behaviour_state['move_stop_cycle'] == MoveStopCycle.MOVE:
+            self.get_logger().info('Move {}'.format(lin_ang_vel))
+            self.pub.publish(new_twist(*lin_ang_vel))
+            moved = True
+            self.robot_behaviour_state['move_stop_cycle'] = MoveStopCycle.STOP
+        elif self.robot_behaviour_state['move_stop_cycle'] == MoveStopCycle.STOP:
+            self.get_logger().info('Stop')
+            self.pub.publish(new_twist(0., 0.))
+            moved = False
+            self.robot_behaviour_state['move_stop_cycle'] = MoveStopCycle.MOVE
+        else:
+            assert False, 'Only two possible values for move_stop_cycle'
+        return moved
 
-    def renable_subscription(self):
-        self.ignore_aruco_detection = False
-        self.destroy_timer(self.renable_subscriptions_timer)
+
+    def timer_callback(self):
+        if self.robot_behaviour_state['lost']:
+            self.get_logger().info('I am lost')
+            if self.robot_behaviour_state['rotated_since_lost'] < 2*np.pi:
+                # if the robot is lost, it is not see 
+                if self._publish_move_stop((0., OMIN)):
+                    self.robot_behaviour_state['robot_behaviour_state'] + OMIN*DT
+            else:
+                # we have rotated enough, we give up
+                self.get_logger().warning('Rotated one full rotation. Giving up ')
+                self._publish_move_stop((0., 0.))
+        else:
+            # The robot is not lost, we know where to go
+            moved = self._publish_move_stop(self.next_vel_to_pub)
+            if moved:
+                self.next_twist_to_pub = new_twist(0., 0.)
+                self.get_logger().info('ready_for_next_twist')
+                self.robot_behaviour_state['ready_for_next_twist'] = True
+
 
 
 

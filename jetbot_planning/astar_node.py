@@ -1,9 +1,11 @@
 # Python builtins
 from enum import Enum
+import os
 
 # Other packages
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import patches
 
 # ROS builtin packages
 import rclpy
@@ -27,9 +29,9 @@ from .obstacle_list_to_graph import ObstacleListToGraph, Robot, MapProperties, A
 
 from .transform_utils import axangle_from_quat, rotmat
 
-VMIN = 0.07
-OMIN = np.pi # one rotation per two sec
-DT = 0.2
+VMAX = VMIN = 0.12 # 13 cm per sec
+OMAX = OMIN = np.pi/2 # one rotation per two sec
+DT = 0.5
 GOAL_MARKER_ID = 7
 PYPLOT_DEBUG = True
 
@@ -110,6 +112,7 @@ def shortest_path_astar(state, obstacles, goal):
     graph = ObstacleListToGraph(map, robot)
     start_state = state
     start_node_tuple = tuple(state.tolist())
+    assert Angle.iswrapped(start_node_tuple[2])
     success, search_path, node2parent, node2dist = astar(
         graph,
         euclidean_heurist_dist,
@@ -117,9 +120,14 @@ def shortest_path_astar(state, obstacles, goal):
         goal_check=goal_check_region)
     path = list(backtrace_path(node2parent, start_node_tuple, search_path[-1]))
     if os.environ.get('DISPLAY', '') and PYPLOT_DEBUG:
-        fig, ax = plt.subplots()
+        fig = plt.figure(num=0)
+        fig.clear()
+        ax = fig.subplots()
+        path = np.asarray(path)
         ax.quiver(path[:, 0], path[:, 1], np.cos(path[:, 2]), np.sin(path[:, 2]), 1., scale=80, label='path')
         plot_map(ax, map, goal, start_state)
+        ax.set_xlim(map.state_min[0], map.state_max[0])
+        ax.set_ylim(map.state_min[1], map.state_max[1])
         ax.legend()
         plt.pause(0.001)
     return path
@@ -130,12 +138,12 @@ def pose3D_to_pose2D(pose):
              pose.orientation.x,
              pose.orientation.y,
              pose.orientation.z]))
-    if not np.allclose(axis, [0, 1, 0]):
+    if not np.allclose(abs(axis @ [0, 1, 0]), 1, atol=0.2):
         assert False, ('Please rotate the marker so that only one axis is'
                 ' rotated {}'''.format(axis))
     pose = np.array(
          [pose.position.x, pose.position.z,
-          angle])
+          Angle.wrap(angle)])
     return pose
 
 def invert_pose2D(xytheta):
@@ -190,9 +198,9 @@ class RobotObstaclePosesFromMarkers():
                 invert_pose2D(self.prev_marker_poses_wrt_robot[ref_mrkr_id]))
 
             # Propagate the prev_markers to the current pose dict
-            for mrkr_id, mrkr_pose in self.prev_marker_poses_wrt_goal.items():
+            for mrkr_id, mrkr_pose in self.prev_marker_poses_wrt_robot.items():
                 if mrkr_id not in marker_poses_wrt_robot:
-                    marker_poses_wrt_robot = pose_multiply(
+                    marker_poses_wrt_robot[mrkr_id] = pose_multiply(
                         change_in_cur_mrkr_wrt_prev,
                         mrkr_pose)
         return marker_poses_wrt_robot
@@ -216,22 +224,22 @@ class RobotObstaclePosesFromMarkers():
             obstacle_pose_wrt_goal = dict()
             for mrkr_id, mrkr_pose in marker_poses_wrt_robot.items():
                 if mrkr_id != GOAL_MARKER_ID:
-                    obstacle_pose_wrt_goal[mrkr_id] = pose_multiply(markr_pose,
+                    obstacle_pose_wrt_goal[mrkr_id] = pose_multiply(mrkr_pose,
                                   robot_pose_wrt_goal)
 
         # Save the dictionary for next time
         self.prev_marker_poses_wrt_robot = marker_poses_wrt_robot
-        return robot_pose_wrt_goal, obstacle_pose_wrt_goal
+        return robot_pose_wrt_goal, list(obstacle_pose_wrt_goal.values())
 
 
-def new_twist(linear_vel, ang_vel, scale_lin=1.0, scale_ang=0.70):
+def new_twist(linear_vel, ang_vel, scale_lin=-0.60, scale_ang=-0.70):
     twist = Twist()
-    twist.linear.x = scale_lin * linear_vel
+    twist.linear.x = scale_lin * min(linear_vel, VMAX)
     twist.linear.y = 0.
     twist.linear.z = 0.
     twist.angular.x = 0.
     twist.angular.y = 0.
-    twist.angular.z = scale_ang * ang_vel
+    twist.angular.z = scale_ang * min(ang_vel, OMAX)
     return twist
 
 
@@ -243,20 +251,21 @@ class Astar(Node):
                                             self.on_aruco_detection, 10)
         self.pub = self.create_publisher(Twist, '/jetbot/cmd_vel', 10)
         self.timer = self.create_timer(DT, self.timer_callback)
-        self.next_twist_to_pub = new_twist(0., 0.)
+        self.next_vel_to_pub = (0., 0.)
         self.robot_obstacle_poses =  RobotObstaclePosesFromMarkers()
         self.robot_behaviour_state = {
             # The robot is lost. Rotate in place until marker is found
             'lost': False,
             # How much have we rotated since we were last lost
             'rotated_since_lost': 0,
+            'no_robot_pose_counter': 0,
 
             # The robot published a move command or a stop command.
             # We are going to cycle between the two for consistency
             'move_stop_cycle': MoveStopCycle.STOP,
 
             # Are we ready for next cmd
-            'ready_for_next_cmd': False
+            'ready_for_next_twist': False
         }
 
 
@@ -267,11 +276,13 @@ class Astar(Node):
             # We are not lost anymore
             self.robot_behaviour_state['lost'] = False
             self.robot_behaviour_state['rotated_since_lost'] = 0
+            self.robot_behaviour_state['no_robot_pose_counter'] = 0
 
             # Are we there yet?
-            if np.linalg.norm(robot_pose, goal) < 0.1:
+            if np.linalg.norm(robot_pose[:2] - goal[:2]) < 0.1:
                 self.get_logger().info('We have arrived')
-                self.next_twist_to_pub = new_twist(0., 0.) # Stop
+                self.next_vel_to_pub = (0., 0.) # Stop
+                self.robot_behaviour_state['ready_for_next_twist'] = False
                 return # Do nothing
 
             if not self.robot_behaviour_state['ready_for_next_twist']:
@@ -282,28 +293,38 @@ class Astar(Node):
             path = shortest_path_astar(robot_pose, obstacles, goal)
             if not len(path):
                 self.get_logger().warning('Path length is zero')
-                self.next_twist_to_pub = new_twist(0., 0.) # Stop
+                self.next_vel_to_pub = (0., 0.) # Stop
+                self.robot_behaviour_state['ready_for_next_twist'] = False
                 return # Do nothing
 
-            first_step = path[0]
+            first_step = path[0:2]
             start, end = first_step
             linvel = np.linalg.norm(end[:2] - start[:2]) / DT
             end_m_start = Angle.diff(end[2], start[2])
             start_m_end = Angle.diff(start[2], end[2])
             ang_vel = (end_m_start 
-                       if abs(end_m_start) < abs(start_m_end) 
+                       if (abs(end_m_start) < abs(start_m_end))
                        else start_m_end) / DT
 
-            self.next_twist_to_pub = new_twist(linvel, ang_vel)
+            self.next_vel_to_pub = (linvel, ang_vel)
+            self.robot_behaviour_state['ready_for_next_twist'] = False
+        else:
+            if self.robot_behaviour_state['no_robot_pose_counter'] >= 300:
+                self.robot_behaviour_state['lost'] = True
+            else:
+                self.robot_behaviour_state['no_robot_pose_counter'] += 1
 
-    def _publish_move_stop(self, linvel, ang_vel):
+
+    def _publish_move_stop(self, lin_ang_vel):
         moved = False
         # Alternate between move and stop cycles
         if self.robot_behaviour_state['move_stop_cycle'] == MoveStopCycle.MOVE:
-            self.pub.publish(new_twist(linvel, ang_vel))
+            self.get_logger().info('Move {}'.format(lin_ang_vel))
+            self.pub.publish(new_twist(*lin_ang_vel))
             moved = True
             self.robot_behaviour_state['move_stop_cycle'] = MoveStopCycle.STOP
         elif self.robot_behaviour_state['move_stop_cycle'] == MoveStopCycle.STOP:
+            self.get_logger().info('Stop')
             self.pub.publish(new_twist(0., 0.))
             moved = False
             self.robot_behaviour_state['move_stop_cycle'] = MoveStopCycle.MOVE
@@ -314,18 +335,20 @@ class Astar(Node):
 
     def timer_callback(self):
         if self.robot_behaviour_state['lost']:
+            self.get_logger().info('I am lost')
             if self.robot_behaviour_state['rotated_since_lost'] < 2*np.pi:
                 # if the robot is lost, it is not see 
-                if self._publish_move_stop(new_twist(0., OMIN)):
+                if self._publish_move_stop((0., OMIN)):
                     self.robot_behaviour_state['robot_behaviour_state'] + OMIN*DT
             else:
                 # we have rotated enough, we give up
-                self._publish_move_stop(new_twist(0., 0.))
+                self.get_logger().warning('Rotated one full rotation. Giving up ')
+                self._publish_move_stop((0., 0.))
         else:
             # The robot is not lost, we know where to go
-            moved = self._publish_move_stop(self.next_twist_to_pub)
+            moved = self._publish_move_stop(self.next_vel_to_pub)
             if moved:
-                self.next_twist_to_pub = new_twist(0., 0.)
+                self.next_vel_to_pub = (0., 0.)
                 self.robot_behaviour_state['ready_for_next_twist'] = True
 
 
