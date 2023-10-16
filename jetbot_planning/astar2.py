@@ -1,4 +1,4 @@
-from hw2_solution import PriorityQueueUpdatable
+from .hw2_solution import PriorityQueueUpdatable
 import sys
 from dataclasses import dataclass, field
 from typing import Any

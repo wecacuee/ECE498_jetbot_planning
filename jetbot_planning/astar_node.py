@@ -99,7 +99,7 @@ def shortest_path_astar(state, obstacles, goal):
             0.01, # x min in meters
             0.01, # y min in meters
             np.pi/20 # theta min in radians
-        ])
+        ]),
         obstacles = np.array([(obs[0], obs[1], 0.10, 0.10)
                               for obs in obstacles])
     )
@@ -124,16 +124,17 @@ def shortest_path_astar(state, obstacles, goal):
         plt.pause(0.001)
     return path
 
-def pose3D_to_pose2D(geometry_pose):
+def pose3D_to_pose2D(pose):
     axis, angle = axangle_from_quat(np.array(
             [pose.orientation.w,
              pose.orientation.x,
              pose.orientation.y,
              pose.orientation.z]))
     if not np.allclose(axis, [0, 1, 0]):
-        assert False, '''Please rotate the marker so that only one axis is rotated'''
+        assert False, ('Please rotate the marker so that only one axis is'
+                'rotated {}'''.format(axis))
     pose = np.array(
-         [m.pose.position.x, m.pose.position.z,
+         [pose.position.x, pose.position.z,
           angle])
     return pose
 
@@ -246,16 +247,16 @@ class Astar(Node):
         self.robot_obstacle_poses =  RobotObstaclePosesFromMarkers()
         self.robot_behaviour_state = {
             # The robot is lost. Rotate in place until marker is found
-            lost : False,
+            'lost': False,
             # How much have we rotated since we were last lost
-            rotated_since_lost : 0,
+            'rotated_since_lost': 0,
 
             # The robot published a move command or a stop command.
             # We are going to cycle between the two for consistency
-            move_stop_cycle: MoveStopCycle.STOP,
+            'move_stop_cycle': MoveStopCycle.STOP,
 
             # Are we ready for next cmd
-            ready_for_next_cmd : False
+            'ready_for_next_cmd': False
         }
 
 
@@ -298,11 +299,11 @@ class Astar(Node):
     def _publish_move_stop(self, linvel, ang_vel):
         moved = False
         # Alternate between move and stop cycles
-        if self.robot_behaviour_state['move_stop_cycle'] = MoveStopCycle.MOVE:
+        if self.robot_behaviour_state['move_stop_cycle'] == MoveStopCycle.MOVE:
             self.pub.publish(new_twist(linvel, ang_vel))
             moved = True
             self.robot_behaviour_state['move_stop_cycle'] = MoveStopCycle.STOP
-        elif self.robot_behaviour_state['move_stop_cycle'] = MoveStopCycle.STOP:
+        elif self.robot_behaviour_state['move_stop_cycle'] == MoveStopCycle.STOP:
             self.pub.publish(new_twist(0., 0.))
             moved = False
             self.robot_behaviour_state['move_stop_cycle'] = MoveStopCycle.MOVE
@@ -313,7 +314,7 @@ class Astar(Node):
 
     def timer_callback(self):
         if self.robot_behaviour_state['lost']:
-            if self.robot_behaviour_state['rotated_since_lost'] < 2*np.pi
+            if self.robot_behaviour_state['rotated_since_lost'] < 2*np.pi:
                 # if the robot is lost, it is not see 
                 if self._publish_move_stop(new_twist(0., OMIN)):
                     self.robot_behaviour_state['robot_behaviour_state'] + OMIN*DT
