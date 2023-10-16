@@ -132,7 +132,7 @@ def pose3D_to_pose2D(pose):
              pose.orientation.z]))
     if not np.allclose(axis, [0, 1, 0]):
         assert False, ('Please rotate the marker so that only one axis is'
-                'rotated {}'''.format(axis))
+                ' rotated {}'''.format(axis))
     pose = np.array(
          [pose.position.x, pose.position.z,
           angle])
